@@ -1,0 +1,338 @@
+#svl
+//
+//	q_dli.svl			small molecule Drug-Like Index
+//					descriptors
+//
+//	13-apr-2004 (db) corrected a bug in n_linkers, n_caps
+//	25-sep-2003 (db) DLI(26) total n of 3-8 rings,
+//			 DLI(27) n of 3 to 8 membered saturated rings,
+//			 DLI(28) n of 3 to 8 membered unsaturated rings
+//	16-jul-2003 (db) fixed DLI(05)
+//	01-feb-2002 (db) made into descriptors
+//	11-dec-2000 (db) changed the definition of polar bonds
+//	19-oct-2000 (db) rewrite of building block calculation code
+//	16-oct-2000 (pl,db) optimized the desc calc code, changed desc formulas
+//	13-oct-2000 (db) % finished goes to the 3D Window, not to the CLI
+//	13-oct-2000 (db) changed descriptor 4 to exclude conjugated bonds
+//	12-sep-2000 (db) created
+//
+// COPYRIGHT (C) 2000-2004 CHEMICAL COMPUTING GROUP INC.  ALL RIGHTS RESERVED.
+//
+// PERMISSION TO USE, COPY, MODIFY AND DISTRIBUTE THIS SOFTWARE IS HEREBY
+// GRANTED PROVIDED THAT: (1) UNMODIFIED OR FUNCTIONALLY EQUIVALENT CODE
+// DERIVED FROM THIS SOFTWARE MUST CONTAIN THIS NOTICE; (2) ALL CODE DERIVED
+// FROM THIS SOFTWARE MUST ACKNOWLEDGE THE AUTHOR(S) AND INSTITUTION(S); (3)
+// THE NAMES OF THE AUTHOR(S) AND INSTITUTION(S) NOT BE USED IN ADVERTISING
+// OR PUBLICITY PERTAINING TO THE DISTRIBUTION OF THE SOFTWARE WITHOUT
+// SPECIFIC, WRITTEN PRIOR PERMISSION; (4) ALL CODE DERIVED FROM THIS SOFTWARE
+// BE EXECUTED WITH THE MOLECULAR OPERATING ENVIRONMENT (MOE) LICENSED FROM
+// CHEMICAL COMPUTING GROUP INC.
+//
+// CHEMICAL COMPUTING GROUP INC. DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+// SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS,
+// AND IN NO EVENT SHALL CHEMICAL COMPUTING GROUP INC. BE LIABLE FOR ANY
+// SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER
+// RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF
+// CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+// CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+//
+//	REFERENCE: (the code does not exactly reproduce their results)
+//		   (and therefore is a partial implementation)
+//	25-sep-2003 added three descriptors to the original 25.
+//
+//	'Drug-like Index: A New Approach To Measure Drug-like Compounds and
+//	Their Diversity', J. Chem. Inf. Comput. Sci. 2000, 40, 1177-1187
+//	Jun Xu, James Stevenson
+//
+//	some descriptors here may differ because of MOE definitions
+//	for SSSR, donors, acceptors, n_of_aromatic_systems, n_nonH_polar_bonds
+//
+
+#set title 	'QuaSAR Drug Likeness Descriptors'
+#set class 	'QuaSAR'
+#set main 'f_dli'
+function ph4_aAcceptor;
+function ph4_aDonor;
+function RenderBallAndStick;
+
+local function f_dli atoms // returns a flat vector of descriptors for atoms
+if isnull atoms then
+RenderBallAndStick [];
+atoms = Atoms[]; 
+endif
+    local desc     = [];		  // a tagged vector of descriptors
+    local atno     = aAtomicNumber atoms;
+    local hdeg     = aHeavyValence atoms;
+    local m_cyclic = aInRing atoms or sm_Match [ '*!-!:[r]', atoms];
+    local m_deg2   = hdeg == 2;
+    local m_deg3   = hdeg == 3;
+    local heavy_atoms = atoms | (atno > 1);
+    local nheavy   = length heavy_atoms;
+
+    if not nheavy then return zero igen 25; endif // exit 0 if no heavy atoms
+
+    local natoms   = iadd [nheavy, iadd aHCount heavy_atoms];
+    local nbonds   = bitshr [iadd hdeg, 1];
+    local O_atoms  = atoms | atno == 8;
+
+	// calculate the heavy bonds as two vectors hA and hB where
+	// each bond is represented by hA(i) --- hB(i) (heavy atoms only)
+
+    local hA = cat apt rep [heavy_atoms, aBondCount heavy_atoms];
+    local hB = cat aBonds heavy_atoms;
+    [hA, hB] = [hA, hB] || [
+	    indexof [hA, heavy_atoms]
+	and indexof [hB, heavy_atoms]
+	and hA < hB
+    ];
+    local b_orders 		= bOrder [hA, hB];
+    local m_aromatic 		= bInHRing [hA, hB];
+    local hybridizations_L	= aGeometry [hA, hB];
+    local hybridizations_R	= reverse hybridizations_L;
+
+	// a building block is a cyclic system, or a cap, or a linker
+	// atoms double- or triple-bonded to rings are also considered cyclic
+	// linkers between blocks are stored in the 2D vector joints
+	// building block atoms are stored in the 2D vector block
+
+    local joints = [hA, hB] || (
+	   [ ( aInRing hA or sm_Match [ '*!-!:[r]', hA] ) ]
+	or [ ( aInRing hB or sm_Match [ '*!-!:[r]', hB] ) ]
+    );
+    if length cat joints then 
+	joints = joints || [ not bInRing joints and bOrder joints == 1 ]; 
+        Unbond joints;
+	local molnums = aMoleculeNumber heavy_atoms;
+	local uniq_moln = uniq molnums;
+	local block = apt get [ 
+	    rep [ heavy_atoms, length uniq_moln ], 
+	    indicesof [ uniq_moln, molnums ]
+	];
+	Bond joints;
+    else 
+	block(1) = heavy_atoms;	// only one block
+    endif
+    local nblocks = length block;
+
+	// determine building block types:
+	// type is a flat vector of int values
+	// 1: cyclic, 2: linker, 3: cap
+
+    local nbrs = pr apt diff [
+	app uniq app cat app BondList block,
+	app uniq apt cat [
+	    app cat app BondListExclusive block,
+	    block
+	]
+    ];
+    nbrs = apt mget [nbrs, aAtomicNumber nbrs > 1];
+    local n_nbrs = app length nbrs;
+    local type = 2 * one n_nbrs;				// linkers
+    type | (n_nbrs == 1) = 3;					// caps
+    type | m_join [ app first block, atoms | m_cyclic ] = 1;	// cyclic
+
+// ------------------ Descriptor Calculation code --------------------
+
+    desc.nheavy = iadd (atno > 1);			// [ 1] #non-H
+    desc.nSSSR = iadd [					// [ 2] total SSSR size
+        length uniq aMoleculeNumber atoms,		// Euler's polyh formula
+        neg length atoms,
+        bitshr [iadd aBondCount atoms, 1]
+    ];
+    if length hA then 
+	desc.cyclization = 100 - 100 * nheavy 		// [ 3] cyclization
+	    / ( nblocks + length hA );
+    else desc.cyclization = 0;
+    endif
+    desc.nrotatable = iadd not (			// [ 4] n of rot bonds
+							// in H suppressed graph
+	   bInRing [hA, hB]	// no rings / aromatics
+	or b_orders <> 1	// no double/triple bonds
+	or aHeavyValence hA < 2	// no terminal bonds
+	or aHeavyValence hB < 2	// no terminal bonds
+	or ( 			// no conjugated bonds
+	    ( not aInHRing hA and not aInHRing hB )
+	    and (b_orders == 1)
+	    and (  (hybridizations_L(1) == 'sp' or hybridizations_L(1) == 'sp2')
+		and(hybridizations_L(2) == 'sp' or hybridizations_L(2) == 'sp2')
+	    )
+	)
+    );
+	//    (carbon - heteroatom is defined as polar)
+	//    (all others are defined as non-polar)
+							// [ 5] number of non-H
+ 							//      polar bonds
+    desc.npolar_nonH = iadd apt xorE (aAtomicNumber [hA, hB] == 6);   
+    desc.nCterm = iadd ( 				// [ 6] n of C's in caps
+	aAtomicNumber cat ( block | ( type == 3 ) ) == 6 );
+    desc.nNH = iadd (atno == 7 and aHCount atoms > 0);	// [ 7] N with #H>0
+    desc.nOH = iadd sm_Match ['[#8;X2H1]', atoms];	// [ 8] # OH groups
+    desc.ndonor = iadd ph4_aDonor heavy_atoms;		// [ 9] #hbond donors
+    desc.nacceptor = iadd ph4_aAcceptor heavy_atoms;	// [10] #hbond acceptors
+    desc.nNnO = iadd (atno == 7 or atno == 8);		// [11] # N and O
+    desc.n2dgAcyclic = iadd (not m_cyclic and m_deg2);	// [12] #deg2 acyclic
+    desc.n2dgCyclic = iadd (m_cyclic and m_deg2);	// [13] #deg2 cyclic
+    desc.n3dgAcyclic = iadd (not m_cyclic and m_deg3);	// [14] #deg3 acyclic
+    desc.n3dgCyclic = iadd (m_cyclic and m_deg3);	// [15] #deg3 cyclic
+    local tobk = [], n_desc = [], np = 0;		
+    local level;
+    for level in [ 'O=C', 'O=C*', 'O=C**' ] loop
+	local pattern = apt tok_cat [ level, ['[#7]', '[#8]'] ];
+	for 2 loop	// we do an exhaustive search of branches on carbonyls
+	    local p = apt cat [ // because sm_MatchAtoms only gets the first 
+		sm_MatchAtoms [first pattern, heavy_atoms], // occurrence
+		sm_MatchAtoms [second pattern, heavy_atoms]
+	    ];
+	    p = p | app length p;
+	    np = np + length p;
+	    local newtobk = [ app second p, app third p ];
+	    if tobk === [] then tobk = newtobk; 
+	    else tobk = apt cat [tobk, newtobk]; 
+	    endif
+	    if length (newtobk | app length newtobk) then Unbond newtobk; endif
+	endloop
+	Bond tobk;		
+	n_desc = cat [n_desc, np];
+	np = 0;
+    endloop						
+    desc.onelevbpattrn   = first n_desc;		// [16] 1-level bond pat
+    desc.twolevbpattrn   = second n_desc;		// [17] 2-level bond pat
+    desc.threelevbpattrn = third n_desc;		// [18] 3-level bond pat
+    desc.nblocks = nblocks;				// [19] n of blocks
+    local al_bonds = [hA,hB] || [ not bInHRing [hA,hB] ];	
+    Unbond al_bonds;
+    desc.naromatic = length uniq aMoleculeNumber ( 	// [20] n aromatic syst
+	heavy_atoms | aInHRing heavy_atoms );
+    Bond al_bonds;
+    desc.ncyclic = iadd ( type == 1 );			// [21] n of cycl blocks
+    desc.nlinkers = iadd ( type == 2 );			// [22] n of linkers
+    desc.ncaps = iadd ( type == 3 );			// [23] n of caps
+    if nblocks > 1 then					// [24] max SSSR size
+        Unbond joints;
+	desc.maxsizeofSSSR = max apt iadd [ 
+	    1,
+	    neg app length block,
+	    bitshr [ app iadd app aHeavyValence block, 1 ]
+	];
+        Bond joints;
+    else desc.maxsizeofSSSR = desc.nSSSR;
+    endif						
+							// [25] max size of cap
+    if desc.ncaps then
+	desc.maxsizeofcap = max ( (app length block) | (type == 3) );
+    else
+	desc.maxsizeofcap = 0;
+    endif
+
+	// ring counts (we delete some atoms)
+
+    local nonringbonds = ([hA,hB] || nest not bInRing [hA,hB]);
+    Unbond nonringbonds;
+
+    oDestroy (Atoms[] | aAtomicNumber Atoms[] == 1);
+    oDestroy (Atoms[] | not aInRing Atoms[]);
+    atoms = Atoms[];
+    local mring = one atoms;
+    local m38ring = orE [
+	aIn3Ring atoms,
+	aIn4Ring atoms,
+	aIn5Ring atoms,
+	aIn6Ring atoms,
+	aIn7Ring atoms,
+	aIn8Ring atoms
+    ];
+    oDestroy (atoms | (mring and not m38ring));	// count will be wrong in some
+    atoms = Atoms[];				// exotic fused ring cases
+
+    desc.n38rings = iadd [				// [26] n 3-8 rings
+        length uniq aMoleculeNumber atoms,
+        neg length atoms,
+        bitshr [iadd aHeavyValence atoms, 1]
+    ];
+
+    local maroring = aInHRing atoms;
+    oDestroy (atoms | maroring);
+    atoms = Atoms[];
+ 
+    hA = cat apt rep [atoms, aHeavyValence atoms];
+    hB = cat aBonds atoms;
+    [hA, hB] = [hA, hB] || [
+	    indexof [hA, atoms]
+	and indexof [hB, atoms]
+	and hA < hB
+    ];
+    b_orders = bOrder [hA, hB];
+    [hA,hB] = [hA,hB] || [b_orders > 1];
+    local b;
+    for b in tr [hA,hB] loop
+	if not andE eqE [oType b, 'atom'] then continue; endif
+
+	if andE geE [app length aBonds b, 3] then
+	    oDestroy b;
+	else
+	    Unbond b;
+	endif
+    endloop
+    atoms = Atoms[];
+    desc.n38satrings = iadd [				//[27] n saturated rings
+        length uniq aMoleculeNumber atoms,
+        neg length atoms,
+        bitshr [iadd aHeavyValence atoms, 1]
+    ];							//[28] unsaturated rings
+    desc.n38unsatrings = sub [desc.n38rings, desc.n38satrings];
+
+
+	// replace []'s with 0's in desc output
+    return second untag desc;
+endfunction
+
+// ---------------------------- Handler Functions -----------------------------
+
+const DESC_TBL = tr [
+    [ 'DLI(01)', 	'# of non-H',				'2D', [] ],
+    [ 'DLI(02)', 	'total SSSR size',			'2D', [] ],
+    [ 'DLI(03)', 	'degree of cyclization',		'2D', [] ],
+    [ 'DLI(04)', 	'# of rotatable bonds',			'2D', [] ],
+    [ 'DLI(05)', 	'# of non-H polar bonds',		'2D', [] ],
+    [ 'DLI(06)', 	'# of carbons in cap fragments',	'2D', [] ],
+    [ 'DLI(07)', 	'# of N with # of H > 0',		'2D', [] ],
+    [ 'DLI(08)', 	'# of hydroxyl groups',			'2D', [] ],
+    [ 'DLI(09)', 	'# of H-bond donors',			'2D', [] ],
+    [ 'DLI(10)', 	'# of H-bond acceptors',		'2D', [] ],
+    [ 'DLI(11)', 	'# of N and O atoms',			'2D', [] ],
+    [ 'DLI(12)', 	'# of 2-degree acyclic atoms',		'2D', [] ],
+    [ 'DLI(13)', 	'# of 2-degree cyclic atoms',		'2D', [] ],
+    [ 'DLI(14)', 	'# of 3-degree acyclic atoms',		'2D', [] ],
+    [ 'DLI(15)', 	'# of 3-degree cyclic atoms',		'2D', [] ],
+    [ 'DLI(16)', 	'# of 1-level bonding patterns',	'2D', [] ],
+    [ 'DLI(17)', 	'# of 2-level bonding patterns',	'2D', [] ],
+    [ 'DLI(18)', 	'# of 3-level bonding patterns',	'2D', [] ],
+    [ 'DLI(19)', 	'# of fragments',			'2D', [] ],
+    [ 'DLI(20)', 	'# of aromatic systems',		'2D', [] ],
+    [ 'DLI(21)', 	'# of cyclic fragments',		'2D', [] ],
+    [ 'DLI(22)', 	'# of linkers',				'2D', [] ],
+    [ 'DLI(23)', 	'# of cap fragments',			'2D', [] ],
+    [ 'DLI(24)', 	'maximum SSSR size',			'2D', [] ],
+    [ 'DLI(25)', 	'maximum cap fragment size',		'2D', [] ],
+    [ 'DLI(26)', 	'total number of 3-8 membered rings',	'2D', [] ],
+    [ 'DLI(27)', 	'total number of 3to8 saturated rings',	'2D', [] ],
+    [ 'DLI(28)', 	'total number of 3to8 unsaturated rings','2D', [] ]
+];
+
+global function QuaSAR_list_DLI [] = DESC_TBL;
+
+global function QuaSAR_calc_DLI [db_mol, codes, parm]
+    local desc = zero codes;
+
+    local [chains, names] = db_CreateMolecule db_mol;
+
+    local atoms = cat cAtoms chains;
+    local dli = f_dli atoms;
+
+    oDestroy chains;
+
+    local idx = indexof [codes, DESC_TBL(1)];
+    (desc | pack idx) = dli[pack idx];
+
+    return desc;
+endfunction
